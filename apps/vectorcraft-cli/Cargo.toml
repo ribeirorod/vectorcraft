@@ -23,6 +23,7 @@ vectorcraft-svg = { workspace = true }
 vectorcraft-mcp = { workspace = true }
 vectorcraft-render = { workspace = true }
 vectorcraft-text = { workspace = true }
+vectorcraft-ui-egui = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
 

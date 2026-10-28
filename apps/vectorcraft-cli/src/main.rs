@@ -8,6 +8,7 @@
 //! vectorcraft-cli info FILE
 //! vectorcraft-cli bench FILE [--size 2880x1800] [--iters 5]
 //! vectorcraft-cli perf [--paths 50000]
+//! vectorcraft-cli embed --control PORT [--size WxH] [--scale S] [--automation-read-root DIR] [--automation-write-root DIR]
 //! ```
 // Denied, not forbidden: the font listers shared with the desktop app allow it for their
 // DirectWrite (Windows) and CoreText (macOS) calls, and nothing else may.
@@ -102,12 +103,136 @@ USAGE:
       Render FILE (any readable format) fitted to WxH (default 2880x1800) and print ms per frame
       (warm), multithreaded and single-threaded.
 
+  vectorcraft-cli embed --control PORT [--size WxH] [--scale S] [--automation-read-root DIR] [--automation-write-root DIR]
+      The app as a live session with no window, serving the control channel (for hosts such as Creative Suite).
   vectorcraft-cli perf [--paths N]
       Check the performance budgets (render, pan, hit test, save/load, SVG, Pathfinder) on a
       synthetic N-path document (default 50000). Exits non-zero if a budget is exceeded.
 ";
 
 /// The usage text plus the formats `document.open` reads and `document.export` writes.
+/// `vectorcraft-cli embed --control PORT …`: the app as a live session with no window, for hosts
+/// that show VectorCraft inside their own UI (Creative Suite). The UI runs off-screen
+/// ([`vectorcraft_ui_egui::embedded::Embedded`], drawn on the CPU) and answers the same JSON-lines
+/// control protocol as `vectorcraft --control` on `127.0.0.1:PORT`. Nothing appears on the
+/// screen and nothing takes focus.
+fn embed(args: &[String]) -> Result<(), String> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    use vectorcraft_ui_egui::embedded::Embedded;
+    /// Longest request line accepted.
+    const MAX_LINE: u64 = 4 * 1024 * 1024;
+    let (mut port, mut size, mut scale) = (None::<u16>, [1440.0f32, 900.0], 1.0f32);
+    let (mut read_root, mut write_root) = (None::<String>, None::<String>);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--control" => port = Some(value()?.parse().map_err(|_| "--control expects a port")?),
+            "--size" => {
+                let v = value()?;
+                let (w, h) = v.split_once(['x', 'X']).ok_or("--size expects WxH, e.g. 1440x900")?;
+                size = [w.trim().parse().map_err(|_| "--size: bad width")?, h.trim().parse().map_err(|_| "--size: bad height")?];
+            }
+            "--scale" => scale = value()?.parse().map_err(|_| "--scale expects a number")?,
+            "--automation-read-root" => read_root = Some(value()?),
+            "--automation-write-root" => write_root = Some(value()?),
+            other => return Err(format!("embed: unknown option `{other}`")),
+        }
+    }
+    let port = port.ok_or("embed: give --control PORT")?;
+    if !(scale.is_finite() && scale > 0.0 && (64.0..=8192.0).contains(&size[0]) && (64.0..=8192.0).contains(&size[1])) {
+        return Err("embed: bad --size/--scale".into());
+    }
+    let roots = AutomationRoots::new(read_root.as_deref().map(Path::new), write_root.as_deref().map(Path::new))?;
+    let services = vectorcraft_ui_egui::Services {
+        read: Some(Box::new(|p: &str| std::fs::read(p).map_err(|e| e.to_string()))),
+        write: Some(Box::new(|p: &str, b: &[u8]| vectorcraft_engine::cmd::fileio::write_atomic(Path::new(p), b).map_err(|e| e.to_string()))),
+        write_shared: Some(std::sync::Arc::new(|p: &str, b: &[u8]| {
+            vectorcraft_engine::cmd::fileio::write_atomic(Path::new(p), b).map_err(|e| e.to_string())
+        })),
+        ..Default::default()
+    };
+    let app = vectorcraft_ui_egui::VectorcraftApp::new(vectorcraft_engine::Session::new(), services).with_automation_roots(roots.clone());
+    if let Some(roots) = &roots {
+        file_access::confine_process(roots.clone());
+    }
+    let mut session = Embedded::new(app, size, scale);
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).map_err(|e| format!("127.0.0.1:{port}: {e}"))?;
+    eprintln!("vectorcraft-cli embed: control channel on 127.0.0.1:{port}");
+    // Connections are read on their own threads; the session answers on this one, between frames.
+    type Request = (String, Value, mpsc::Sender<Value>);
+    let (tx, rx) = mpsc::channel::<Request>();
+    std::thread::Builder::new()
+        .name("embed-accept".into())
+        .spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let tx = tx.clone();
+                let _ = std::thread::Builder::new().name("embed-conn".into()).spawn(move || {
+                    let Ok(read_half) = conn.try_clone() else { return };
+                    let mut reader = BufReader::new(read_half);
+                    let mut out = conn;
+                    loop {
+                        let mut line = Vec::new();
+                        match reader.by_ref().take(MAX_LINE).read_until(b'\n', &mut line) {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let text = String::from_utf8_lossy(&line);
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        // Only requests: anything else closes the connection (as the app's own server does).
+                        let Some(msg) = serde_json::from_str::<Value>(text.trim()).ok().filter(|m| m.get("method").and_then(Value::as_str).is_some())
+                        else {
+                            let _ = writeln!(out, "{}", json!({"ok": false, "error": "not a request; closing the connection"}));
+                            return;
+                        };
+                        let id = msg.get("id").cloned().unwrap_or(Value::Null);
+                        let method = msg.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+                        let params = msg.get("params").cloned().unwrap_or(json!({}));
+                        let (rtx, rrx) = mpsc::channel();
+                        if tx.send((method, params, rtx)).is_err() {
+                            return;
+                        }
+                        let mut reply = rrx.recv_timeout(Duration::from_secs(120)).unwrap_or_else(|_| json!({"ok": false, "error": "timed out"}));
+                        if let Some(o) = reply.as_object_mut() {
+                            o.insert("id".into(), id);
+                        }
+                        if writeln!(out, "{reply}").is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    let timeout = Duration::from_secs(60);
+    loop {
+        let start = Instant::now();
+        while let Ok((method, params, reply)) = rx.try_recv() {
+            let _ = reply.send(session.request(&method, params, timeout)); // the client may have gone
+        }
+        if session.quit_requested() {
+            break;
+        }
+        session.step();
+        // ~30 frames a second while something moves, a few when idle.
+        let frame = if session.busy() { Duration::from_millis(33) } else { Duration::from_millis(100) };
+        if let Some(rest) = frame.checked_sub(start.elapsed()) {
+            match rx.recv_timeout(rest) {
+                Ok((method, params, reply)) => {
+                    let _ = reply.send(session.request(&method, params, timeout));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+    Ok(())
+}
+
 fn usage() -> String {
     use vectorcraft_engine::cmd::fileio::{OPEN_EXTS, export_extensions};
     format!("{USAGE}\nReadable formats: .{}\nWritable formats: .{}\n", OPEN_EXTS.join(", ."), export_extensions().join(", ."))
@@ -129,6 +254,7 @@ fn main() -> ExitCode {
         Some("info") => info(&args[1..]),
         Some("bench") => bench(&args[1..]),
         Some("perf") => perf::run(&args[1..]),
+        Some("embed") => embed(&args[1..]),
         Some("-h" | "--help" | "help") | None => {
             out!("{}", usage());
             Ok(())

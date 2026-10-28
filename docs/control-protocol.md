@@ -748,3 +748,15 @@ resizes the root divider (`false`/`true` path entries select first/second childr
 `SetStackOpen {panel,open}` / `ResizeStack {panel,height}` control accordion entries.
 The UI dispatches these same commands. Unknown panel IDs, invalid geometry, and stale
 split paths return an error without changing the workspace.
+
+## Embedded session (no window)
+
+`vectorcraft-cli embed --control PORT [--size WxH] [--scale S] [--automation-read-root DIR]
+[--automation-write-root DIR]` runs the whole app with no window, for hosts that show VectorCraft
+inside their own UI (Creative Suite). The UI runs in an off-screen egui context
+(`crates/ui-egui/src/embedded.rs`) and is drawn by a CPU rasterizer (`softpaint.rs`, shared with
+LightCraft), about 30 frames a second while something moves. It serves this protocol on
+`127.0.0.1:PORT`: `ui.screenshot` returns its frames, `ui.*` input drives it, `engine.execute`
+runs commands, and `app.quit` ends it (asking first about unsaved documents, as the window does).
+Nothing appears on the screen and nothing takes focus, on any system; no GPU or display server is
+needed.

@@ -25,6 +25,8 @@ pub mod cursors;
 pub mod dialogs;
 pub mod dock;
 mod edit_toolbar;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod embedded;
 pub mod find_font;
 pub mod floating;
 pub mod font_menu;
@@ -48,6 +50,7 @@ pub mod render_worker;
 mod scrub;
 pub mod shortcut_editor;
 pub mod shortcuts;
+pub mod softpaint;
 pub mod state;
 pub mod sysclip;
 pub mod theme;

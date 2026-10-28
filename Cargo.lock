@@ -4570,6 +4570,7 @@ dependencies = [
  "vectorcraft-svg",
  "vectorcraft-testkit",
  "vectorcraft-text",
+ "vectorcraft-ui-egui",
  "windows",
 ]
 
